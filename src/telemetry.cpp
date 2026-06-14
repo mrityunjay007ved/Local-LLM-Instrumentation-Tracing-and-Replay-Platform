@@ -199,9 +199,9 @@ static void run_tui() {
     using namespace ftxui;
     auto screen = ScreenInteractive::Fullscreen();
 
-    int  selected_token = 0;
-    int  selected_layer = 0;
-    bool token_view     = true;
+    int selected_token = 0;
+    int selected_layer = 0;
+    int focus          = 0;  // 0=tokens, 1=layers, 2=metrics
 
     std::thread refresher([&] {
         while (g_running) {
@@ -226,16 +226,16 @@ static void run_tui() {
              i < std::min(n_tokens, tok_start + tok_window); i++) {
             TokenBatch tb = g_history.get(i);
             int real_count = 0;
-for (auto& cap : tb.layers) {
-    std::string cn(cap.name);
-    if (cn.find("kq_soft_max") == std::string::npos) real_count++;
-}
-std::string line =
-    "tok." + std::to_string(tb.token_idx) +
-    " [" + std::string(tb.token_str) + "]" +
-    " → " + std::to_string(real_count) + " layers" +
-    (tb.complete ? "" : " ...");
-            if (token_view && i == selected_token)
+            for (auto& cap : tb.layers) {
+                std::string cn(cap.name);
+                if (cn.find("kq_soft_max") == std::string::npos) real_count++;
+            }
+            std::string line =
+                "tok." + std::to_string(tb.token_idx) +
+                " [" + std::string(tb.token_str) + "]" +
+                " → " + std::to_string(real_count) + " layers" +
+                (tb.complete ? "" : " ...");
+            if (focus == 0 && i == selected_token)
                 token_rows.push_back(text(line) | inverted);
             else
                 token_rows.push_back(text(line));
@@ -243,7 +243,8 @@ std::string line =
         if (token_rows.empty())
             token_rows.push_back(text("waiting for tokens..."));
         auto token_panel = window(
-            text(" 1. TOKEN HISTORY  [j/k] select  [Enter] drill in "),
+            text(focus == 0 ? " 1. TOKEN HISTORY [active] "
+                            : " 1. TOKEN HISTORY "),
             vbox(token_rows)
         );
 
@@ -274,7 +275,7 @@ std::string line =
                     std::string(c.name) +
                     " | " + std::to_string((int)c.latency_ms) + "ms" +
                     " | " + std::to_string((int)(c.sparsity * 100)) + "%";
-                if (!token_view && vi == selected_layer)
+                if (focus == 1 && vi == selected_layer)
                     layer_rows.push_back(text(line) | inverted);
                 else
                     layer_rows.push_back(text(line));
@@ -283,7 +284,7 @@ std::string line =
         if (layer_rows.empty())
             layer_rows.push_back(text("select a token first"));
         auto layer_panel = window(
-            text(" 2. LAYERS  [j/k] select  [Esc] back "),
+            text(focus == 1 ? " 2. LAYERS [active] " : " 2. LAYERS "),
             vbox(layer_rows)
         );
 
@@ -293,34 +294,39 @@ std::string line =
             TokenBatch tb = g_history.get(selected_token);
             if (!visible_indices.empty() &&
                 selected_layer < (int)visible_indices.size()) {
-                LayerCapture& sel = tb.layers[visible_indices[selected_layer]];
+                LayerCapture& sel =
+                    tb.layers[visible_indices[selected_layer]];
                 metric_rows = {
                     text("Token   : [" + std::string(tb.token_str) + "]"),
                     text("Layer   : " + std::string(sel.name)),
-                    text("Latency : " + std::to_string(sel.latency_ms) + " ms"),
+                    text("Latency : " +
+                         std::to_string(sel.latency_ms) + " ms"),
                     hbox({
                         text("Sparsity: "),
                         gauge(sel.sparsity) | flex,
-                        text(" " + std::to_string((int)(sel.sparsity*100)) + "%"),
+                        text(" " +
+                             std::to_string((int)(sel.sparsity*100)) + "%"),
                     }),
                 };
             }
         }
         if (metric_rows.empty()) metric_rows = { text("waiting...") };
-        auto metrics = window(text(" 3. RUNTIME METRICS "), vbox(metric_rows));
+        auto metrics = window(
+            text(focus == 2 ? " 3. RUNTIME METRICS [active] "
+                            : " 3. RUNTIME METRICS "),
+            vbox(metric_rows)
+        );
 
         // ── panel 4: attention matrix ─────────────────
         Elements attn_rows;
         if (n_tokens > 0 && selected_token < n_tokens) {
             TokenBatch tb = g_history.get(selected_token);
-
             int target_layer_idx = -1;
             if (!visible_indices.empty() &&
                 selected_layer < (int)visible_indices.size()) {
                 target_layer_idx =
                     tb.layers[visible_indices[selected_layer]].layer_idx;
             }
-
             LayerCapture attn_cap;
             bool found = false;
             for (auto& cap : tb.layers) {
@@ -333,7 +339,6 @@ std::string line =
                     break;
                 }
             }
-
             if (found && attn_cap.attn_n > 0) {
                 attn_rows.push_back(
                     text("layer " + std::to_string(target_layer_idx) +
@@ -355,7 +360,7 @@ std::string line =
                 }
             } else {
                 attn_rows.push_back(text("no attn data"));
-                attn_rows.push_back(text("drill into a layer"));
+                attn_rows.push_back(text("select a layer"));
             }
         }
         if (attn_rows.empty()) attn_rows.push_back(text("waiting..."));
@@ -368,7 +373,8 @@ std::string line =
         Elements anomaly_rows;
         if (g_anomaly.ready) {
             anomaly_rows.push_back(
-                text("mean: " + std::to_string((int)g_anomaly.mean_latency) + "ms")
+                text("mean: " +
+                     std::to_string((int)g_anomaly.mean_latency) + "ms")
             );
             anomaly_rows.push_back(separator());
             for (auto& s : g_anomaly.stats) {
@@ -377,7 +383,8 @@ std::string line =
                 if (s.is_sparse) flag += " ⚠SPARSE";
                 std::string line =
                     std::string(s.name) +
-                    " | " + std::to_string((int)s.avg_latency) + "ms" + flag;
+                    " | " + std::to_string((int)s.avg_latency) + "ms" +
+                    flag;
                 if (s.is_slow || s.is_sparse)
                     anomaly_rows.push_back(text(line) | bold);
                 else
@@ -393,7 +400,7 @@ std::string line =
         );
 
         return vbox({
-            text(" TRANSFORMER TELEMETRY  |  [j/k] nav  |  [Enter] drill  |  [Esc] back  |  [Q] quit ")
+            text(" TRANSFORMER TELEMETRY  |  [Tab] focus  |  [j/k] nav  |  [Enter] drill  |  [Esc] back  |  [Q] quit ")
                 | center,
             separator(),
             hbox({
@@ -401,7 +408,7 @@ std::string line =
                     token_panel | size(HEIGHT, LESS_THAN, 12),
                     layer_panel | size(HEIGHT, LESS_THAN, 12),
                     hbox({
-                        metrics   | flex,
+                        metrics    | flex,
                         attn_panel | flex,
                     }),
                 }) | flex,
@@ -409,32 +416,42 @@ std::string line =
                     window(
                         text(" STATUS "),
                         vbox({
-                            text("Tokens : " + std::to_string(g_token_count.load())),
-                            text("Hist   : " + std::to_string(n_tokens) + "/" +
+                            text("Tokens : " +
+                                 std::to_string(g_token_count.load())),
+                            text("Hist   : " +
+                                 std::to_string(n_tokens) + "/" +
                                  std::to_string(TokenHistory::CAP)),
                             text(g_running.load() ? "● running" : "■ done"),
                             separator(),
-                            text(token_view ? "token nav" : "layer nav"),
-                            text("sel_tok: " + std::to_string(selected_token)),
-                            text("sel_lyr: " + std::to_string(selected_layer)),
+                            text(focus == 0 ? "focus: tokens" :
+                                 focus == 1 ? "focus: layers" :
+                                              "focus: metrics"),
+                            text("sel_tok: " +
+                                 std::to_string(selected_token)),
+                            text("sel_lyr: " +
+                                 std::to_string(selected_layer)),
                         })
                     ) | size(HEIGHT, LESS_THAN, 10),
                     anomaly_panel | flex,
                 }) | size(WIDTH, LESS_THAN, 30),
             }),
         });
-    });  // ← closes Renderer([&] {
+    });
 
     auto component = CatchEvent(renderer, [&](Event event) {
         int n_tokens = g_history.size();
+
+        if (event == Event::Tab) {
+            focus = (focus + 1) % 3;
+            return true;
+        }
         if (event == Event::Character('j')) {
-            if (token_view) {
+            if (focus == 0) {
                 selected_token = std::min(selected_token + 1,
                                           std::max(0, n_tokens - 1));
-            } else {
+            } else if (focus == 1) {
                 if (n_tokens > 0 && selected_token < n_tokens) {
                     TokenBatch tb = g_history.get(selected_token);
-                    // use visible count for layer nav
                     int vis_count = 0;
                     for (auto& c : tb.layers) {
                         std::string cn(c.name);
@@ -448,19 +465,23 @@ std::string line =
             return true;
         }
         if (event == Event::Character('k')) {
-            if (token_view)
+            if (focus == 0)
                 selected_token = std::max(selected_token - 1, 0);
-            else
+            else if (focus == 1)
                 selected_layer = std::max(selected_layer - 1, 0);
             return true;
         }
         if (event == Event::Return) {
-            token_view     = false;
-            selected_layer = 0;
+            if (focus == 0) {
+                focus          = 1;
+                selected_layer = 0;
+            } else if (focus == 1) {
+                focus = 2;
+            }
             return true;
         }
         if (event == Event::Escape) {
-            token_view = true;
+            if (focus > 0) focus--;
             return true;
         }
         if (event == Event::Character('q') ||
