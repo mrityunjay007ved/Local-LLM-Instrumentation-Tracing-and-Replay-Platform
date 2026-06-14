@@ -18,12 +18,14 @@
 
 // ── shared state ──────────────────────────────────────────
 RingBuffer g_rb;
+TokenHistory g_history; 
 std::atomic<bool> g_running     = true;
 std::atomic<int>  g_token_count = 0;
 
 // ── eval callback data ────────────────────────────────────
 struct EvalCallbackData {
     RingBuffer* rb;
+    TokenHistory* history;   
     std::chrono::time_point<std::chrono::high_resolution_clock> layer_start;
 };
 
@@ -39,12 +41,9 @@ static bool eval_callback(struct ggml_tensor* t, bool ask, void* user_data) {
     if (name.find("(cont)")      != std::string::npos) return true;
     if (name.find("(reshaped)")  != std::string::npos) return true;
 
-    // capture these three:
     bool is_layer  = name.find("l_out")       != std::string::npos;
-    bool is_mlp    = name.find("ffn_out")     != std::string::npos;
     bool is_kqsm   = name.find("kq_soft_max") != std::string::npos;
-    if (!is_layer && !is_mlp && !is_kqsm) return true;
-
+    if (!is_layer && !is_kqsm) return true;
     auto* data = (EvalCallbackData*)user_data;
     auto  now  = std::chrono::high_resolution_clock::now();
     float ms   = std::chrono::duration<float, std::milli>(
@@ -112,7 +111,7 @@ static bool eval_callback(struct ggml_tensor* t, bool ask, void* user_data) {
     c.attn_n     = 0;
     snprintf(c.name, sizeof(c.name), "%s", t->name);
     data->rb->push(c);
-
+    data->history->push_layer(c);  
     data->layer_start = now;
     return true;
 }
@@ -137,6 +136,7 @@ static void run_inference(const std::string& model_path,
 
     EvalCallbackData cb_data;
     cb_data.rb          = &g_rb;
+    cb_data.history     = &g_history; 
     cb_data.layer_start = std::chrono::high_resolution_clock::now();
 
     llama_context_params ctx_params = llama_context_default_params();
@@ -157,25 +157,34 @@ static void run_inference(const std::string& model_path,
     llama_batch batch = llama_batch_get_one(
                             prompt_tokens.data(), prompt_tokens.size());
     int n_vocab = llama_vocab_n_tokens(vocab);
-
+    char token_buf[32];
     for (int n_pos = 0;
          n_pos + batch.n_tokens < n_prompt + 64 && g_running; ) {
+        int current_token_idx = g_token_count.load();
+        llama_token cur_tok = batch.token[0];
+         int n = llama_token_to_piece(vocab, cur_tok,
+                                 token_buf, sizeof(token_buf), 0, true);
+        if (n < 0) snprintf(token_buf, sizeof(token_buf), "?");
+    else token_buf[n] = '\0';
+    g_history.begin_token(current_token_idx, token_buf);
 
-        cb_data.layer_start = std::chrono::high_resolution_clock::now();
-        if (llama_decode(ctx, batch)) break;
+    cb_data.layer_start = std::chrono::high_resolution_clock::now();
+    if (llama_decode(ctx, batch)) break;
 
-        float* logits   = llama_get_logits(ctx);
-        float logit_max = *std::max_element(logits, logits + n_vocab);
-        float logit_min = *std::min_element(logits, logits + n_vocab);
-        (void)logit_max;
-        (void)logit_min;
+    // mark end — all layer captures for this token are now in the batch
+    g_history.end_token();
 
-        n_pos += batch.n_tokens;
-        g_token_count++;
+    float* logits   = llama_get_logits(ctx);
+    float logit_max = *std::max_element(logits, logits + n_vocab);
+    float logit_min = *std::min_element(logits, logits + n_vocab);
+    (void)logit_max; (void)logit_min;
 
-        llama_token new_token_id = llama_sampler_sample(smpl, ctx, -1);
-        if (llama_vocab_is_eog(vocab, new_token_id)) break;
-        batch = llama_batch_get_one(&new_token_id, 1);
+    n_pos += batch.n_tokens;
+    g_token_count++;
+
+     llama_token new_token_id = llama_sampler_sample(smpl, ctx, -1);
+    if (llama_vocab_is_eog(vocab, new_token_id)) break;
+    batch = llama_batch_get_one(&new_token_id, 1);
     }
 
     llama_sampler_free(smpl);
@@ -189,7 +198,9 @@ static void run_tui() {
     using namespace ftxui;
     auto screen = ScreenInteractive::Fullscreen();
 
-    int selected = 0;
+    int selected_token = 0;   // which token we're viewing
+    int selected_layer = 0;   // which layer within that token
+    bool token_view    = true; // true = navigating tokens, false = navigating layers
 
     std::thread refresher([&] {
         while (g_running) {
@@ -200,148 +211,156 @@ static void run_tui() {
     });
 
     auto renderer = Renderer([&] {
-        int n = g_rb.size();
-        if (n > 0 && selected >= n) selected = n - 1;
+        int n_tokens = g_history.size();
+        if (n_tokens > 0 && selected_token >= n_tokens)
+            selected_token = n_tokens - 1;
 
-        // ── panel 1: layer list, j/k navigable ───────
-        Elements rows;
-        int window_size = 18;
-        int start = std::max(0, selected - window_size / 2);
-        if (start + window_size > n)
-            start = std::max(0, n - window_size);
-
-        for (int i = start; i < std::min(n, start + window_size); i++) {
-            LayerCapture c = g_rb.get(i);
-            std::string cname(c.name);
-
-            // skip KQsoft entries from the layer list
-            if (cname.find("kq_soft_max") != std::string::npos) continue;
-
+        // ── panel 1: token list ───────────────────────
+        Elements token_rows;
+        for (int i = 0; i < n_tokens; i++) {
+            TokenBatch tb = g_history.get(i);
             std::string line =
-                cname +
-                " | " + std::to_string((int)c.latency_ms) + "ms" +
-                " | " + std::to_string((int)(c.sparsity * 100)) + "%";
-            if (i == selected)
-                rows.push_back(text(line) | inverted);
+                "tok." + std::to_string(tb.token_idx) +
+                " [" + std::string(tb.token_str) + "]" +
+                " → " + std::to_string(tb.layers.size()) + " layers" +
+                (tb.complete ? "" : " ...");
+            if (token_view && i == selected_token)
+                token_rows.push_back(text(line) | inverted);
             else
-                rows.push_back(text(line));
+                token_rows.push_back(text(line));
         }
-        if (rows.empty()) rows.push_back(text("waiting for inference..."));
+        if (token_rows.empty())
+            token_rows.push_back(text("waiting for tokens..."));
 
-        auto topology = window(
-            text(" 1. LAYER CAPTURES  [j/k navigate] "),
-            vbox(rows)
+        auto token_panel = window(
+            text(" 1. TOKEN HISTORY  [j/k] select  [Enter] drill in "),
+            vbox(token_rows)
         );
 
-        // ── panel 2: live counters ────────────────────
-        auto live = window(
-            text(" 2. LIVE PACKETS "),
-            vbox({
-                text("Tokens : " +
-                     std::to_string(g_token_count.load())),
-                text("Buffer : " +
-                     std::to_string(n) + "/" +
-                     std::to_string(RingBuffer::CAP)),
-                text(g_running.load() ? "● running" : "■ done"),
-                separator(),
-                text("sel: " + std::to_string(selected)),
-            })
+        // ── panel 2: layer list for selected token ────
+        Elements layer_rows;
+        if (n_tokens > 0 && selected_token < n_tokens) {
+            TokenBatch tb = g_history.get(selected_token);
+            int n_layers = (int)tb.layers.size();
+            if (selected_layer >= n_layers && n_layers > 0)
+                selected_layer = n_layers - 1;
+
+            for (int i = 0; i < n_layers; i++) {
+                LayerCapture& c = tb.layers[i];
+                std::string cname(c.name);
+                if (cname.find("kq_soft_max") != std::string::npos) continue;
+
+                std::string line =
+                    cname +
+                    " | " + std::to_string((int)c.latency_ms) + "ms" +
+                    " | " + std::to_string((int)(c.sparsity * 100)) + "%";
+                if (!token_view && i == selected_layer)
+                    layer_rows.push_back(text(line) | inverted);
+                else
+                    layer_rows.push_back(text(line));
+            }
+        }
+        if (layer_rows.empty())
+            layer_rows.push_back(text("select a token first"));
+
+        auto layer_panel = window(
+            text(" 2. LAYERS  [j/k] select  [Esc] back "),
+            vbox(layer_rows)
         );
 
         // ── panel 3: selected layer metrics ──────────
         Elements metric_rows;
-        if (n > 0 && selected < n) {
-            LayerCapture sel = g_rb.get(selected);
-            metric_rows = {
-                text("Layer   : " + std::string(sel.name)),
-                text("Latency : " +
-                     std::to_string(sel.latency_ms) + " ms"),
-                hbox({
-                    text("Sparsity: "),
-                    gauge(sel.sparsity) | flex,
-                    text(" " +
-                         std::to_string((int)(sel.sparsity * 100)) + "%"),
-                }),
-                text("idx     : " + std::to_string(sel.layer_idx)),
-            };
-        } else {
-            metric_rows = { text("waiting...") };
+        if (n_tokens > 0 && selected_token < n_tokens) {
+            TokenBatch tb = g_history.get(selected_token);
+            if (!tb.layers.empty() &&
+                selected_layer < (int)tb.layers.size()) {
+                LayerCapture& sel = tb.layers[selected_layer];
+                metric_rows = {
+                    text("Token   : [" + std::string(tb.token_str) + "]"),
+                    text("Layer   : " + std::string(sel.name)),
+                    text("Latency : " +
+                         std::to_string(sel.latency_ms) + " ms"),
+                    hbox({
+                        text("Sparsity: "),
+                        gauge(sel.sparsity) | flex,
+                        text(" " +
+                             std::to_string((int)(sel.sparsity*100)) + "%"),
+                    }),
+                };
+            }
         }
+        if (metric_rows.empty()) metric_rows = { text("waiting...") };
+
         auto metrics = window(
             text(" 3. RUNTIME METRICS "),
             vbox(metric_rows)
         );
 
-        // ── panel 4: attention matrix ─────────────────
-        // find KQsoft entry matching selected layer's idx
-        LayerCapture attn_data;
-        bool found_attn = false;
-        if (n > 0 && selected < n) {
-            LayerCapture sel = g_rb.get(selected);
-            for (int i = 0; i < n; i++) {
-                LayerCapture c = g_rb.get(i);
-                std::string cname(c.name);
-                if (cname.find("kq_soft_max") != std::string::npos &&
-                    c.layer_idx == sel.layer_idx &&
-                    c.has_attn) {
-                    attn_data  = c;
-                    found_attn = true;
-                    break;
-                }
-            }
-        }
-
-        Elements attn_rows;
-        if (found_attn && attn_data.has_attn && attn_data.attn_n > 0) {
-            int n_tok = attn_data.attn_n;
-            for (int row = 0; row < n_tok; row++) {
-                std::string line;
-                for (int col = 0; col < n_tok; col++) {
-                    float v = attn_data.attn[row][col];
-                    if      (v > 0.5f)  line += "█";
-                    else if (v > 0.25f) line += "▓";
-                    else if (v > 0.1f)  line += "▒";
-                    else if (v > 0.01f) line += "░";
-                    else                line += " ";
-                }
-                attn_rows.push_back(text(line));
-            }
-        } else {
-            attn_rows.push_back(text("no attn data"));
-            attn_rows.push_back(text("navigate to a"));
-            attn_rows.push_back(text("layer to load"));
-        }
-
-        auto attn = window(
-            text(" 4. ATTENTION MATRIX "),
-            vbox(attn_rows)
+        // ── panel 4: live status ──────────────────────
+        auto live = window(
+            text(" 4. STATUS "),
+            vbox({
+                text("Tokens : " +
+                     std::to_string(g_token_count.load())),
+                text("History: " +
+                     std::to_string(n_tokens) + "/" +
+                     std::to_string(TokenHistory::CAP)),
+                text(g_running.load() ? "● running" : "■ done"),
+                separator(),
+                text(token_view ? "MODE: token nav" : "MODE: layer nav"),
+                text("sel_tok: " + std::to_string(selected_token)),
+                text("sel_lyr: " + std::to_string(selected_layer)),
+            })
         );
 
         return vbox({
-            text(" TRANSFORMER TELEMETRY  |  [j/k] navigate  |  [Q] quit ")
+            text(" TRANSFORMER TELEMETRY  |  [j/k] nav  |  [Enter] drill  |  [Esc] back  |  [Q] quit ")
                 | center,
             separator(),
             hbox({
                 vbox({
-                    topology | size(HEIGHT, LESS_THAN, 20),
-                    hbox({
-                        metrics | flex,
-                        attn | flex,
-                    }),
+                    token_panel | size(HEIGHT, LESS_THAN, 15),
+                    layer_panel | size(HEIGHT, LESS_THAN, 15),
+                    metrics,
                 }) | flex,
-                live | size(WIDTH, LESS_THAN, 25),
+                live | size(WIDTH, LESS_THAN, 28),
             }),
         });
     });
 
     auto component = CatchEvent(renderer, [&](Event event) {
-        int n = g_rb.size();
+        int n_tokens = g_history.size();
+
         if (event == Event::Character('j')) {
-            selected = std::min(selected + 1, std::max(0, n - 1));
+            if (token_view) {
+                selected_token = std::min(selected_token + 1,
+                                          std::max(0, n_tokens - 1));
+            } else {
+                if (n_tokens > 0 && selected_token < n_tokens) {
+                    TokenBatch tb = g_history.get(selected_token);
+                    selected_layer = std::min(selected_layer + 1,
+                        std::max(0, (int)tb.layers.size() - 1));
+                }
+            }
             return true;
         }
         if (event == Event::Character('k')) {
-            selected = std::max(selected - 1, 0);
+            if (token_view) {
+                selected_token = std::max(selected_token - 1, 0);
+            } else {
+                selected_layer = std::max(selected_layer - 1, 0);
+            }
+            return true;
+        }
+        if (event == Event::Return) {
+            // drill into selected token's layers
+            token_view    = false;
+            selected_layer = 0;
+            return true;
+        }
+        if (event == Event::Escape) {
+            // go back to token list
+            token_view = true;
             return true;
         }
         if (event == Event::Character('q') ||
@@ -356,7 +375,6 @@ static void run_tui() {
     screen.Loop(component);
     refresher.join();
 }
-
 // ── main ──────────────────────────────────────────────────
 int main(int argc, char** argv) {
     std::setlocale(LC_NUMERIC, "C");
