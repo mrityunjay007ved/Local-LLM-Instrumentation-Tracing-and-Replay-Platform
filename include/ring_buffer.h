@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <map>
 
 struct LayerCapture {
     int   layer_idx  = -1;
@@ -26,7 +27,6 @@ struct TokenBatch {
 
 struct TokenHistory {
     static constexpr int CAP = 64;
-
     TokenBatch batches[CAP];
     int count     = 0;
     int write_idx = 0;
@@ -69,9 +69,80 @@ struct TokenHistory {
     }
 };
 
+struct LayerStats {
+    int   layer_idx    = -1;
+    char  name[64]     = {};
+    float avg_latency  = 0.0f;
+    float avg_sparsity = 0.0f;
+    float max_latency  = 0.0f;
+    float min_latency  = 0.0f;
+    int   sample_count = 0;
+    bool  is_slow      = false;
+    bool  is_sparse    = false;
+};
+
+struct AnomalyReport {
+    std::vector<LayerStats> stats;
+    float mean_latency  = 0.0f;
+    float mean_sparsity = 0.0f;
+    bool  ready         = false;
+
+    void compute(TokenHistory& history) {
+        std::map<int, LayerStats> acc;
+
+        int n_tokens = history.size();
+        for (int t = 0; t < n_tokens; t++) {
+            TokenBatch tb = history.get(t);
+            for (auto& c : tb.layers) {
+                int idx = c.layer_idx;
+                if (idx < 0) continue;
+                auto& s = acc[idx];
+                s.layer_idx = idx;
+                snprintf(s.name, sizeof(s.name), "%s", c.name);
+                s.avg_latency  += c.latency_ms;
+                s.avg_sparsity += c.sparsity;
+                s.max_latency   = std::max(s.max_latency, c.latency_ms);
+                if (s.min_latency == 0.0f)
+                    s.min_latency = c.latency_ms;
+                else
+                    s.min_latency = std::min(s.min_latency, c.latency_ms);
+                s.sample_count++;
+            }
+        }
+
+        for (auto& [idx, s] : acc) {
+            if (s.sample_count > 0) {
+                s.avg_latency  /= s.sample_count;
+                s.avg_sparsity /= s.sample_count;
+            }
+            stats.push_back(s);
+        }
+
+        std::sort(stats.begin(), stats.end(),
+            [](const LayerStats& a, const LayerStats& b) {
+                return a.layer_idx < b.layer_idx;
+            });
+
+        if (!stats.empty()) {
+            for (auto& s : stats) {
+                mean_latency  += s.avg_latency;
+                mean_sparsity += s.avg_sparsity;
+            }
+            mean_latency  /= stats.size();
+            mean_sparsity /= stats.size();
+        }
+
+        for (auto& s : stats) {
+            s.is_slow   = s.avg_latency  > mean_latency  * 2.0f;
+            s.is_sparse = s.avg_sparsity > mean_sparsity * 2.0f;
+        }
+
+        ready = true;
+    }
+};
+
 struct RingBuffer {
     static constexpr int CAP = 512;
-
     LayerCapture buf[CAP];
     int write_idx = 0;
     int count     = 0;

@@ -16,34 +16,32 @@
 #include <cstring>
 #include <cmath>
 
-// ── shared state ──────────────────────────────────────────
-RingBuffer g_rb;
-TokenHistory g_history; 
+RingBuffer    g_rb;
+TokenHistory  g_history;
+AnomalyReport g_anomaly;
 std::atomic<bool> g_running     = true;
 std::atomic<int>  g_token_count = 0;
 
-// ── eval callback data ────────────────────────────────────
 struct EvalCallbackData {
-    RingBuffer* rb;
-    TokenHistory* history;   
+    RingBuffer*   rb;
+    TokenHistory* history;
     std::chrono::time_point<std::chrono::high_resolution_clock> layer_start;
+    int last_layer_idx = -99;
 };
 
-// fires after every tensor op inside llama_decode
 static bool eval_callback(struct ggml_tensor* t, bool ask, void* user_data) {
     if (!t || !t->name || t->name[0] == '\0') return true;
 
     std::string name(t->name);
+    if (name.find("(view)")     != std::string::npos) return true;
+    if (name.find("(permuted)") != std::string::npos) return true;
+    if (name.find("(cont)")     != std::string::npos) return true;
+    if (name.find("(reshaped)") != std::string::npos) return true;
 
-    // skip views and permutations — only capture base tensors
-    if (name.find("(view)")      != std::string::npos) return true;
-    if (name.find("(permuted)")  != std::string::npos) return true;
-    if (name.find("(cont)")      != std::string::npos) return true;
-    if (name.find("(reshaped)")  != std::string::npos) return true;
-
-    bool is_layer  = name.find("l_out")       != std::string::npos;
-    bool is_kqsm   = name.find("kq_soft_max") != std::string::npos;
+    bool is_layer = name.find("l_out")       != std::string::npos;
+    bool is_kqsm  = name.find("kq_soft_max") != std::string::npos;
     if (!is_layer && !is_kqsm) return true;
+
     auto* data = (EvalCallbackData*)user_data;
     auto  now  = std::chrono::high_resolution_clock::now();
     float ms   = std::chrono::duration<float, std::milli>(
@@ -52,7 +50,15 @@ static bool eval_callback(struct ggml_tensor* t, bool ask, void* user_data) {
     int layer_idx = -1;
     sscanf(t->name, "%*[^-]-%d", &layer_idx);
 
-    // ── attention matrix ──────────────────────────────
+    // deduplicate
+    if (is_layer) {
+        if (layer_idx == data->last_layer_idx) {
+            data->layer_start = now;
+            return true;
+        }
+        data->last_layer_idx = layer_idx;
+    }
+
     if (is_kqsm) {
         LayerCapture c;
         c.layer_idx  = layer_idx;
@@ -63,30 +69,23 @@ static bool eval_callback(struct ggml_tensor* t, bool ask, void* user_data) {
         c.has_attn   = false;
         c.attn_n     = 0;
         snprintf(c.name, sizeof(c.name), "kq_soft_max-%d", layer_idx);
-
         if (t->data && t->buffer &&
             ggml_backend_buffer_is_host(t->buffer) &&
             t->type == GGML_TYPE_F32) {
-
-            // shape: [n_kv, n_tokens, n_heads]
             int seq    = (int)t->ne[0];
             int n      = std::min(seq, 8);
             c.attn_n   = n;
             c.has_attn = true;
-
             float* fdata = (float*)t->data;
-            for (int row = 0; row < n; row++) {
-                for (int col = 0; col < n; col++) {
+            for (int row = 0; row < n; row++)
+                for (int col = 0; col < n; col++)
                     c.attn[row][col] = fdata[row * seq + col];
-                }
-            }
         }
         data->rb->push(c);
         data->layer_start = now;
         return true;
     }
 
-    // ── layer output / mlp output ─────────────────────
     float sparsity = 0.0f;
     if (t->data && t->buffer &&
         ggml_backend_buffer_is_host(t->buffer) &&
@@ -95,9 +94,8 @@ static bool eval_callback(struct ggml_tensor* t, bool ask, void* user_data) {
         int64_t total  = ggml_nelements(t);
         int64_t sample = std::min(total, (int64_t)1024);
         int     zeros  = 0;
-        for (int64_t i = 0; i < sample; i++) {
+        for (int64_t i = 0; i < sample; i++)
             if (fabsf(fdata[i]) < 1e-6f) zeros++;
-        }
         sparsity = (float)zeros / (float)sample;
     }
 
@@ -111,11 +109,11 @@ static bool eval_callback(struct ggml_tensor* t, bool ask, void* user_data) {
     c.attn_n     = 0;
     snprintf(c.name, sizeof(c.name), "%s", t->name);
     data->rb->push(c);
-    data->history->push_layer(c);  
+    data->history->push_layer(c);
     data->layer_start = now;
     return true;
 }
-// ── inference thread ──────────────────────────────────────
+
 static void run_inference(const std::string& model_path,
                           const std::string& prompt) {
     ggml_backend_load_all();
@@ -136,14 +134,14 @@ static void run_inference(const std::string& model_path,
 
     EvalCallbackData cb_data;
     cb_data.rb          = &g_rb;
-    cb_data.history     = &g_history; 
+    cb_data.history     = &g_history;
     cb_data.layer_start = std::chrono::high_resolution_clock::now();
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx             = n_prompt + 128;
     ctx_params.n_batch           = n_prompt;
     ctx_params.no_perf           = false;
-    ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    ctx_params.flash_attn_type   = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     ctx_params.cb_eval           = eval_callback;
     ctx_params.cb_eval_user_data = &cb_data;
 
@@ -158,49 +156,52 @@ static void run_inference(const std::string& model_path,
                             prompt_tokens.data(), prompt_tokens.size());
     int n_vocab = llama_vocab_n_tokens(vocab);
     char token_buf[32];
+
     for (int n_pos = 0;
          n_pos + batch.n_tokens < n_prompt + 64 && g_running; ) {
+
         int current_token_idx = g_token_count.load();
         llama_token cur_tok = batch.token[0];
-         int n = llama_token_to_piece(vocab, cur_tok,
-                                 token_buf, sizeof(token_buf), 0, true);
+        int n = llama_token_to_piece(vocab, cur_tok,
+                                     token_buf, sizeof(token_buf), 0, true);
         if (n < 0) snprintf(token_buf, sizeof(token_buf), "?");
-    else token_buf[n] = '\0';
-    g_history.begin_token(current_token_idx, token_buf);
+        else token_buf[n] = '\0';
 
-    cb_data.layer_start = std::chrono::high_resolution_clock::now();
-    if (llama_decode(ctx, batch)) break;
+        g_history.begin_token(current_token_idx, token_buf);
+        cb_data.layer_start = std::chrono::high_resolution_clock::now();
+        cb_data.last_layer_idx = -99;  // reset per token
 
-    // mark end — all layer captures for this token are now in the batch
-    g_history.end_token();
+        if (llama_decode(ctx, batch)) break;
 
-    float* logits   = llama_get_logits(ctx);
-    float logit_max = *std::max_element(logits, logits + n_vocab);
-    float logit_min = *std::min_element(logits, logits + n_vocab);
-    (void)logit_max; (void)logit_min;
+        g_history.end_token();
 
-    n_pos += batch.n_tokens;
-    g_token_count++;
+        float* logits   = llama_get_logits(ctx);
+        float logit_max = *std::max_element(logits, logits + n_vocab);
+        float logit_min = *std::min_element(logits, logits + n_vocab);
+        (void)logit_max; (void)logit_min;
 
-     llama_token new_token_id = llama_sampler_sample(smpl, ctx, -1);
-    if (llama_vocab_is_eog(vocab, new_token_id)) break;
-    batch = llama_batch_get_one(&new_token_id, 1);
+        n_pos += batch.n_tokens;
+        g_token_count++;
+
+        llama_token new_token_id = llama_sampler_sample(smpl, ctx, -1);
+        if (llama_vocab_is_eog(vocab, new_token_id)) break;
+        batch = llama_batch_get_one(&new_token_id, 1);
     }
 
     llama_sampler_free(smpl);
     llama_free(ctx);
     llama_model_free(model);
+    g_anomaly.compute(g_history);
     g_running = false;
 }
 
-// ── TUI thread ────────────────────────────────────────────
 static void run_tui() {
     using namespace ftxui;
     auto screen = ScreenInteractive::Fullscreen();
 
-    int selected_token = 0;   // which token we're viewing
-    int selected_layer = 0;   // which layer within that token
-    bool token_view    = true; // true = navigating tokens, false = navigating layers
+    int  selected_token = 0;
+    int  selected_layer = 0;
+    bool token_view     = true;
 
     std::thread refresher([&] {
         while (g_running) {
@@ -215,9 +216,14 @@ static void run_tui() {
         if (n_tokens > 0 && selected_token >= n_tokens)
             selected_token = n_tokens - 1;
 
-        // ── panel 1: token list ───────────────────────
+        // panel 1: token list with scrolling window
         Elements token_rows;
-        for (int i = 0; i < n_tokens; i++) {
+        int tok_window = 10;
+        int tok_start  = std::max(0, selected_token - tok_window / 2);
+        if (tok_start + tok_window > n_tokens)
+            tok_start = std::max(0, n_tokens - tok_window);
+        for (int i = tok_start;
+             i < std::min(n_tokens, tok_start + tok_window); i++) {
             TokenBatch tb = g_history.get(i);
             std::string line =
                 "tok." + std::to_string(tb.token_idx) +
@@ -231,25 +237,22 @@ static void run_tui() {
         }
         if (token_rows.empty())
             token_rows.push_back(text("waiting for tokens..."));
-
         auto token_panel = window(
             text(" 1. TOKEN HISTORY  [j/k] select  [Enter] drill in "),
             vbox(token_rows)
         );
 
-        // ── panel 2: layer list for selected token ────
+        // panel 2: layers for selected token
         Elements layer_rows;
         if (n_tokens > 0 && selected_token < n_tokens) {
             TokenBatch tb = g_history.get(selected_token);
             int n_layers = (int)tb.layers.size();
             if (selected_layer >= n_layers && n_layers > 0)
                 selected_layer = n_layers - 1;
-
             for (int i = 0; i < n_layers; i++) {
                 LayerCapture& c = tb.layers[i];
                 std::string cname(c.name);
                 if (cname.find("kq_soft_max") != std::string::npos) continue;
-
                 std::string line =
                     cname +
                     " | " + std::to_string((int)c.latency_ms) + "ms" +
@@ -262,13 +265,12 @@ static void run_tui() {
         }
         if (layer_rows.empty())
             layer_rows.push_back(text("select a token first"));
-
         auto layer_panel = window(
             text(" 2. LAYERS  [j/k] select  [Esc] back "),
             vbox(layer_rows)
         );
 
-        // ── panel 3: selected layer metrics ──────────
+        // panel 3: metrics
         Elements metric_rows;
         if (n_tokens > 0 && selected_token < n_tokens) {
             TokenBatch tb = g_history.get(selected_token);
@@ -278,39 +280,44 @@ static void run_tui() {
                 metric_rows = {
                     text("Token   : [" + std::string(tb.token_str) + "]"),
                     text("Layer   : " + std::string(sel.name)),
-                    text("Latency : " +
-                         std::to_string(sel.latency_ms) + " ms"),
+                    text("Latency : " + std::to_string(sel.latency_ms) + " ms"),
                     hbox({
                         text("Sparsity: "),
                         gauge(sel.sparsity) | flex,
-                        text(" " +
-                             std::to_string((int)(sel.sparsity*100)) + "%"),
+                        text(" " + std::to_string((int)(sel.sparsity*100)) + "%"),
                     }),
                 };
             }
         }
         if (metric_rows.empty()) metric_rows = { text("waiting...") };
+        auto metrics = window(text(" 3. RUNTIME METRICS "), vbox(metric_rows));
 
-        auto metrics = window(
-            text(" 3. RUNTIME METRICS "),
-            vbox(metric_rows)
-        );
-
-        // ── panel 4: live status ──────────────────────
-        auto live = window(
-            text(" 4. STATUS "),
-            vbox({
-                text("Tokens : " +
-                     std::to_string(g_token_count.load())),
-                text("History: " +
-                     std::to_string(n_tokens) + "/" +
-                     std::to_string(TokenHistory::CAP)),
-                text(g_running.load() ? "● running" : "■ done"),
-                separator(),
-                text(token_view ? "MODE: token nav" : "MODE: layer nav"),
-                text("sel_tok: " + std::to_string(selected_token)),
-                text("sel_lyr: " + std::to_string(selected_layer)),
-            })
+        // panel 4: anomaly report
+        Elements anomaly_rows;
+        if (g_anomaly.ready) {
+            anomaly_rows.push_back(
+                text("mean: " + std::to_string((int)g_anomaly.mean_latency) + "ms")
+            );
+            anomaly_rows.push_back(separator());
+            for (auto& s : g_anomaly.stats) {
+                std::string flag;
+                if (s.is_slow)   flag += " ⚠SLOW";
+                if (s.is_sparse) flag += " ⚠SPARSE";
+                std::string line =
+                    std::string(s.name) +
+                    " | " + std::to_string((int)s.avg_latency) + "ms" + flag;
+                if (s.is_slow || s.is_sparse)
+                    anomaly_rows.push_back(text(line) | bold);
+                else
+                    anomaly_rows.push_back(text(line));
+            }
+        } else {
+            anomaly_rows.push_back(text("computing after"));
+            anomaly_rows.push_back(text("inference ends..."));
+        }
+        auto anomaly_panel = window(
+            text(" 4. ANOMALY REPORT "),
+            vbox(anomaly_rows) | frame | size(HEIGHT, LESS_THAN, 15)
         );
 
         return vbox({
@@ -319,18 +326,32 @@ static void run_tui() {
             separator(),
             hbox({
                 vbox({
-                    token_panel | size(HEIGHT, LESS_THAN, 15),
-                    layer_panel | size(HEIGHT, LESS_THAN, 15),
+                    token_panel | size(HEIGHT, LESS_THAN, 12),
+                    layer_panel | size(HEIGHT, LESS_THAN, 12),
                     metrics,
                 }) | flex,
-                live | size(WIDTH, LESS_THAN, 28),
+                vbox({
+                    window(
+                        text(" STATUS "),
+                        vbox({
+                            text("Tokens : " + std::to_string(g_token_count.load())),
+                            text("Hist   : " + std::to_string(n_tokens) + "/" +
+                                 std::to_string(TokenHistory::CAP)),
+                            text(g_running.load() ? "● running" : "■ done"),
+                            separator(),
+                            text(token_view ? "token nav" : "layer nav"),
+                            text("sel_tok: " + std::to_string(selected_token)),
+                            text("sel_lyr: " + std::to_string(selected_layer)),
+                        })
+                    ) | size(HEIGHT, LESS_THAN, 10),
+                    anomaly_panel | flex,
+                }) | size(WIDTH, LESS_THAN, 30),
             }),
         });
     });
 
     auto component = CatchEvent(renderer, [&](Event event) {
         int n_tokens = g_history.size();
-
         if (event == Event::Character('j')) {
             if (token_view) {
                 selected_token = std::min(selected_token + 1,
@@ -345,21 +366,18 @@ static void run_tui() {
             return true;
         }
         if (event == Event::Character('k')) {
-            if (token_view) {
+            if (token_view)
                 selected_token = std::max(selected_token - 1, 0);
-            } else {
+            else
                 selected_layer = std::max(selected_layer - 1, 0);
-            }
             return true;
         }
         if (event == Event::Return) {
-            // drill into selected token's layers
-            token_view    = false;
+            token_view     = false;
             selected_layer = 0;
             return true;
         }
         if (event == Event::Escape) {
-            // go back to token list
             token_view = true;
             return true;
         }
@@ -375,18 +393,15 @@ static void run_tui() {
     screen.Loop(component);
     refresher.join();
 }
-// ── main ──────────────────────────────────────────────────
+
 int main(int argc, char** argv) {
     std::setlocale(LC_NUMERIC, "C");
-
     if (argc < 2) {
         printf("usage: %s model.gguf [prompt]\n", argv[0]);
         return 1;
     }
-
     std::string model_path = argv[1];
     std::string prompt     = argc > 2 ? argv[2] : "Hello my name is";
-
     std::thread inference_thread(run_inference, model_path, prompt);
     run_tui();
     inference_thread.join();
