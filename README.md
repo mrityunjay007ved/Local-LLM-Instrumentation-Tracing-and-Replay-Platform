@@ -15,6 +15,16 @@ Hooks non-invasively into llama.cpp's inference pipeline and captures real-time 
 
 ![alt text](image-1.png)
 ## Architecture
+
+```
+llama_decode fires
+    ↓ cb_eval callback (fires after every tensor op)
+    ↓ captures latency + sparsity per layer
+RingBuffer (512 slots, mutex-protected)
+    ↓ TUI reads every 200ms
+FTXUI TUI (4 panels, j/k navigation)
+```
+
 ## Dependencies
 
 - [llama.cpp](https://github.com/ggml-org/llama.cpp)
