@@ -1,0 +1,10 @@
+cat > .gitignore << 'EOF'
+build/
+*.o
+*.a
+*.dylib
+*.so
+.DS_Store
+tensors.txt
+*.gguf
+EOF
