@@ -241,30 +241,44 @@ static void run_tui() {
             text(" 1. TOKEN HISTORY  [j/k] select  [Enter] drill in "),
             vbox(token_rows)
         );
+// panel 2: layers for selected token
+Elements layer_rows;
+if (n_tokens > 0 && selected_token < n_tokens) {
+    TokenBatch tb = g_history.get(selected_token);
 
-        // panel 2: layers for selected token
-        Elements layer_rows;
-        if (n_tokens > 0 && selected_token < n_tokens) {
-            TokenBatch tb = g_history.get(selected_token);
-            int n_layers = (int)tb.layers.size();
-            if (selected_layer >= n_layers && n_layers > 0)
-                selected_layer = n_layers - 1;
-            for (int i = 0; i < n_layers; i++) {
-                LayerCapture& c = tb.layers[i];
-                std::string cname(c.name);
-                if (cname.find("kq_soft_max") != std::string::npos) continue;
-                std::string line =
-                    cname +
-                    " | " + std::to_string((int)c.latency_ms) + "ms" +
-                    " | " + std::to_string((int)(c.sparsity * 100)) + "%";
-                if (!token_view && i == selected_layer)
-                    layer_rows.push_back(text(line) | inverted);
-                else
-                    layer_rows.push_back(text(line));
-            }
-        }
-        if (layer_rows.empty())
-            layer_rows.push_back(text("select a token first"));
+    // pre-filter: remove kq_soft_max entries
+    std::vector<int> visible_indices;
+    for (int i = 0; i < (int)tb.layers.size(); i++) {
+        std::string cname(tb.layers[i].name);
+        if (cname.find("kq_soft_max") == std::string::npos)
+            visible_indices.push_back(i);
+    }
+
+    int n_visible = (int)visible_indices.size();
+    if (selected_layer >= n_visible && n_visible > 0)
+        selected_layer = n_visible - 1;
+
+    int lyr_window = 10;
+    int lyr_start  = std::max(0, selected_layer - lyr_window / 2);
+    if (lyr_start + lyr_window > n_visible)
+        lyr_start = std::max(0, n_visible - lyr_window);
+
+    for (int vi = lyr_start;
+         vi < std::min(n_visible, lyr_start + lyr_window); vi++) {
+        int i = visible_indices[vi];
+        LayerCapture& c = tb.layers[i];
+        std::string line =
+            std::string(c.name) +
+            " | " + std::to_string((int)c.latency_ms) + "ms" +
+            " | " + std::to_string((int)(c.sparsity * 100)) + "%";
+        if (!token_view && vi == selected_layer)
+            layer_rows.push_back(text(line) | inverted);
+        else
+            layer_rows.push_back(text(line));
+    }
+}
+if (layer_rows.empty())
+    layer_rows.push_back(text("select a token first"));
         auto layer_panel = window(
             text(" 2. LAYERS  [j/k] select  [Esc] back "),
             vbox(layer_rows)
