@@ -13,7 +13,8 @@ Hooks non-invasively into llama.cpp's inference pipeline and captures real-time 
 
 ## Demo
 
-![alt text](image-1.png)
+<img width="1086" height="561" alt="Screenshot 2026-06-15 at 3 05 09 PM" src="https://github.com/user-attachments/assets/2931c3e1-3cbc-40ff-b7fc-1b6f3a001fe6" />
+
 ## Architecture
 
 ```
