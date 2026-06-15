@@ -16,6 +16,9 @@ struct LayerCapture {
     float attn[8][8] = {};
     bool  has_attn   = false;
     int   attn_n     = 0;
+    int64_t shape[4] = {0, 0, 0, 0};
+    int     n_dims   = 0;
+
 };
 
 struct TokenBatch {
@@ -79,6 +82,7 @@ struct LayerStats {
     int   sample_count = 0;
     bool  is_slow      = false;
     bool  is_sparse    = false;
+
 };
 
 struct AnomalyReport {
@@ -98,8 +102,9 @@ struct AnomalyReport {
                 if (idx < 0) continue;
                 auto& s = acc[idx];
                 s.layer_idx = idx;
+                if (s.sample_count == 0)  // only set name on first capture
                 snprintf(s.name, sizeof(s.name), "%s", c.name);
-                s.avg_latency  += c.latency_ms;
+                    s.avg_latency  += c.latency_ms;
                 s.avg_sparsity += c.sparsity;
                 s.max_latency   = std::max(s.max_latency, c.latency_ms);
                 if (s.min_latency == 0.0f)
@@ -134,7 +139,7 @@ struct AnomalyReport {
 
         for (auto& s : stats) {
             s.is_slow   = s.avg_latency  > mean_latency  * 2.0f;
-            s.is_sparse = s.avg_sparsity > mean_sparsity * 2.0f;
+            s.is_sparse = mean_sparsity > 0.01f && s.avg_sparsity > mean_sparsity * 2.0f;
         }
 
         ready = true;

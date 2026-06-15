@@ -67,6 +67,7 @@ static bool eval_callback(struct ggml_tensor* t, bool ask, void* user_data) {
         c.logit_min  = 0.0f;
         c.has_attn   = false;
         c.attn_n     = 0;
+        c.n_dims     = 0;
         snprintf(c.name, sizeof(c.name), "kq_soft_max-%d", layer_idx);
         if (t->data && t->buffer &&
             ggml_backend_buffer_is_host(t->buffer) &&
@@ -108,6 +109,15 @@ static bool eval_callback(struct ggml_tensor* t, bool ask, void* user_data) {
     c.has_attn   = false;
     c.attn_n     = 0;
     snprintf(c.name, sizeof(c.name), "%s", t->name);
+
+    // capture shape
+    c.n_dims = 0;
+    for (int d = 0; d < 4; d++) {
+        c.shape[d] = t->ne[d];
+        if (t->ne[d] > 1) c.n_dims = d + 1;
+    }
+    if (c.n_dims == 0) c.n_dims = 1;
+
     data->rb->push(c);
     data->history->push_layer(c);
     data->layer_start = now;
@@ -201,7 +211,7 @@ static void run_tui() {
 
     int selected_token = 0;
     int selected_layer = 0;
-    int focus          = 0;  // 0=tokens, 1=layers, 2=metrics
+    int focus          = 0;
 
     std::thread refresher([&] {
         while (g_running) {
@@ -228,7 +238,8 @@ static void run_tui() {
             int real_count = 0;
             for (auto& cap : tb.layers) {
                 std::string cn(cap.name);
-                if (cn.find("kq_soft_max") == std::string::npos) real_count++;
+                if (cn.find("kq_soft_max") == std::string::npos)
+                    real_count++;
             }
             std::string line =
                 "tok." + std::to_string(tb.token_idx) +
@@ -296,9 +307,18 @@ static void run_tui() {
                 selected_layer < (int)visible_indices.size()) {
                 LayerCapture& sel =
                     tb.layers[visible_indices[selected_layer]];
+
+                std::string shape_str = "[";
+                for (int d = 0; d < sel.n_dims; d++) {
+                    if (d > 0) shape_str += ", ";
+                    shape_str += std::to_string(sel.shape[d]);
+                }
+                shape_str += "]";
+
                 metric_rows = {
                     text("Token   : [" + std::string(tb.token_str) + "]"),
                     text("Layer   : " + std::string(sel.name)),
+                    text("Shape   : " + shape_str),
                     text("Latency : " +
                          std::to_string(sel.latency_ms) + " ms"),
                     hbox({
@@ -381,8 +401,11 @@ static void run_tui() {
                 std::string flag;
                 if (s.is_slow)   flag += " ⚠SLOW";
                 if (s.is_sparse) flag += " ⚠SPARSE";
+                // use short name to fit in panel
+                std::string short_name = "L" +
+                    std::to_string(s.layer_idx);
                 std::string line =
-                    std::string(s.name) +
+                    short_name +
                     " | " + std::to_string((int)s.avg_latency) + "ms" +
                     flag;
                 if (s.is_slow || s.is_sparse)
@@ -396,7 +419,7 @@ static void run_tui() {
         }
         auto anomaly_panel = window(
             text(" 5. ANOMALY REPORT "),
-            vbox(anomaly_rows) | frame | size(HEIGHT, LESS_THAN, 15)
+            vbox(anomaly_rows) | frame | size(HEIGHT, LESS_THAN, 20)
         );
 
         return vbox({
@@ -433,7 +456,7 @@ static void run_tui() {
                         })
                     ) | size(HEIGHT, LESS_THAN, 10),
                     anomaly_panel | flex,
-                }) | size(WIDTH, LESS_THAN, 30),
+                }) | size(WIDTH, LESS_THAN, 22),
             }),
         });
     });
