@@ -3,18 +3,18 @@
 A lightweight C++ terminal UI for inspecting local transformer model internals in real time — built on top of [llama.cpp](https://github.com/ggml-org/llama.cpp).
 
 ## Demo
-
+Demo Youtube Video :- https://youtu.be/DdXSFhnWlWI
 ![Transformer Telemetry TUI](screenshot.png)
 ## What it does
 
-Hooks non-invasively into llama.cpp's `cb_eval` callback — no model source code modified — and captures real-time metrics as tokens flow through the transformer:
+Hooks non-invasively into llama.cpp's `cb_eval` callback no model source code modified and captures real-time metrics as tokens flow through the transformer:
 
-- **Per-layer execution latency** — see which of the 32 layers dominates compute time
-- **Tensor shape inspection** — shape of each layer's output tensor
-- **Attention matrix visualization** — real `kq_soft_max` weights rendered as ASCII block characters
-- **Activation sparsity** — fraction of near-zero activations per layer
-- **Anomaly detection** — automatically flags layers with latency or sparsity outliers
-- **Token history** — navigate by token, then drill into per-layer data
+- **Per-layer execution latency** :— see which of the 32 layers dominates compute time
+- **Tensor shape inspection** :— shape of each layer's output tensor
+- **Attention matrix visualization** :— real `kq_soft_max` weights rendered as ASCII block characters
+- **Activation sparsity** :— fraction of near-zero activations per layer
+- **Anomaly detection** :— automatically flags layers with latency or sparsity outliers
+- **Token history** :— navigate by token, then drill into per-layer data
 
 ## Architecture
 
