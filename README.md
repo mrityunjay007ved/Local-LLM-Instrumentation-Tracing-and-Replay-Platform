@@ -3,7 +3,7 @@
 A lightweight C++ terminal UI for inspecting local transformer model internals in real time — built on top of [llama.cpp](https://github.com/ggml-org/llama.cpp).
 
 ## Demo
-Demo Youtube Video :- https://youtu.be/DdXSFhnWlWI
+Demo Youtube Video :- [https://youtu.be/DdXSFhnWlWI](https://youtu.be/S__cCNRZyCw)
 ![Transformer Telemetry TUI](screenshot.png)
 ## What it does
 
